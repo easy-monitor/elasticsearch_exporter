@@ -1,20 +1,28 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"time"
 
-	"context"
-
+	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/justwatchcom/elasticsearch_exporter/collector"
+	"github.com/justwatchcom/elasticsearch_exporter/config"
 	"github.com/justwatchcom/elasticsearch_exporter/pkg/clusterinfo"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/yaml.v2"
 )
 
 func main() {
@@ -93,6 +101,14 @@ func main() {
 		)
 		os.Exit(1)
 	}
+	conf, err := loadConfig()
+	if err != nil {
+		_ = level.Error(logger).Log(
+			"msg", "failed to load conf.yml",
+			"err", err.Error(),
+		)
+		os.Exit(1)
+	}
 
 	// returns nil if not provided and falls back to simple TCP.
 	tlsConfig := createTLSConfig(*esCA, *esClientCert, *esClientPrivateKey, *esInsecureSkipVerify)
@@ -160,6 +176,7 @@ func main() {
 	prometheus.MustRegister(clusterInfoRetriever)
 
 	mux := http.DefaultServeMux
+	mux.Handle("/scrape", handerForScrape(conf.Modules, logger, httpClient, *esClusterInfoInterval, *esAllNodes, *esNode))
 	mux.Handle(*metricsPath, prometheus.Handler())
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, err = w.Write([]byte(`<html>
@@ -210,4 +227,79 @@ func main() {
 	_ = level.Info(logger).Log("msg", "shutting down")
 	_ = server.Shutdown(srvCtx)
 	cancel()
+}
+func handerForScrape(modules []*config.Module, logger log.Logger, client *http.Client, duration time.Duration,esAllNodes bool, esNode string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target, err := getTarget(r.URL.Query(), modules)
+		if err != nil {
+			_, _ = w.Write([]byte(err.Error()))
+			return
+		}
+		fmt.Println(target)
+		newURL, err := url.Parse(target)
+		clusterInfoRetriever := clusterinfo.New(logger, client, newURL, duration)
+		registry := prometheus.NewRegistry()
+		registry.MustRegister(collector.NewClusterHealth(logger,client, newURL))
+		registry.MustRegister(collector.NewNodes(logger, client, newURL, esAllNodes, esNode))
+		registry.MustRegister(clusterInfoRetriever)
+
+		gatherers := prometheus.Gatherers{}
+		gatherers = append(gatherers, prometheus.DefaultGatherer)
+		gatherers = append(gatherers, registry)
+
+		// Delegate http serving to Prometheus client library, which will call collector.Collect.
+		h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{
+			ErrorHandling: promhttp.ContinueOnError,
+		})
+
+		h.ServeHTTP(w, r)
+
+	})
+}
+
+func getTarget(uri url.Values, modules []*config.Module) (string, error) {
+	target := uri.Get("target")
+	module := uri.Get("module")
+	if target == "" {
+		//_, _ = w.Write([]byte("args error"))
+		return "", errors.New("args error")
+	}
+	var result string
+	if module != "" {
+		var username string
+		var password string
+		for i := 0; i < len(modules); i++ {
+			if modules[i].Name == module {
+				username = modules[i].Username
+				password = modules[i].Password
+				break
+			}
+		}
+		if username == "" || password == "" {
+			//_, _ = w.Write([]byte("module not found in conf.yml"))
+			return "", errors.New("module not found in conf.yml")
+		}
+		result = username + ":" + password + "@" + target
+	} else {
+		result = target
+	}
+	if !strings.HasPrefix(result, "http://") {
+		result = "http://" + result
+	}
+	return result, nil
+}
+
+func loadConfig() (*config.Conf, error) {
+	path, _ := os.Getwd()
+	path = filepath.Join(path, "conf/conf.yml")
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, errors.New("read conf.yml fail:" + path)
+	}
+	conf := new(config.Conf)
+	err = yaml.Unmarshal(data, conf)
+	if err != nil {
+		return nil, errors.New("unmarshal conf.yml fail")
+	}
+	return conf, nil
 }

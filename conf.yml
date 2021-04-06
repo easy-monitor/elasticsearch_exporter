@@ -1,0 +1,4 @@
+module:
+  - name: elastic
+    username: elastic
+    password: easyops
