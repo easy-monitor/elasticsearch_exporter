@@ -237,21 +237,20 @@ func handerForScrape(modules []*config.Module, logger log.Logger, client *http.C
 		}
 		fmt.Println(target)
 		newURL, err := url.Parse(target)
+
 		clusterInfoRetriever := clusterinfo.New(logger, client, newURL, duration)
 		registry := prometheus.NewRegistry()
+		versionMetric := version.NewCollector("elasticsearch_exporter")
+		registry.MustRegister(versionMetric)
 		registry.MustRegister(collector.NewClusterHealth(logger,client, newURL))
 		registry.MustRegister(collector.NewNodes(logger, client, newURL, esAllNodes, esNode))
+
 		registry.MustRegister(clusterInfoRetriever)
-
-		gatherers := prometheus.Gatherers{}
-		gatherers = append(gatherers, prometheus.DefaultGatherer)
-		gatherers = append(gatherers, registry)
-
+		gatherers := prometheus.Gatherers{
+			registry,
+		}
 		// Delegate http serving to Prometheus client library, which will call collector.Collect.
-		h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{
-			ErrorHandling: promhttp.ContinueOnError,
-		})
-
+		h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})
 		h.ServeHTTP(w, r)
 
 	})
